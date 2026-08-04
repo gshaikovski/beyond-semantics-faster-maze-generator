@@ -1,4 +1,7 @@
 mod balanced;
+mod cli;
+mod dedup;
+mod exclude;
 mod generators;
 mod parameters;
 mod prng;
@@ -9,18 +12,24 @@ mod types;
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use serde::Serialize;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
 use std::time::Instant;
 
+use crate::cli::{Args, BalancedOpts, Partition, PartitionKind, Validated};
+use crate::dedup::{layout_key, LayoutKey, SeenSet};
 use crate::parameters::{print_all_params_help, print_param_help, GeneratorParams};
 use crate::prng::create_instance_prng;
 use crate::serializer::process_batch;
 use crate::types::MazeResult;
 
-#[derive(Clone, Copy, Debug, ValueEnum, Hash)]
+#[derive(Clone, Copy, Debug, ValueEnum, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GeneratorType {
     Dfs,
     Kruskal,
@@ -29,109 +38,22 @@ pub enum GeneratorType {
     DrunkardsWalk,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, Hash)]
+#[derive(Clone, Copy, Debug, ValueEnum, Hash, Serialize)]
 pub enum SolverType {
     #[value(name = "astar")]
+    #[serde(rename = "astar")]
     AStar,
-}
-
-#[derive(Parser)]
-#[command(name = "maze_gen_fast")]
-#[command(about = "Parallel maze generation with hierarchical PRNG")]
-struct Args {
-    /// Generator algorithm
-    #[arg(short, long, value_enum, required_unless_present = "list_params")]
-    generator: Option<GeneratorType>,
-
-    /// Solver algorithm
-    #[arg(short, long, value_enum, required_unless_present = "list_params")]
-    solver: Option<SolverType>,
-
-    /// Master seed for PRNG
-    #[arg(long, default_value = "42")]
-    seed: u64,
-
-    /// Number of mazes to generate
-    #[arg(short, long, required_unless_present = "list_params")]
-    count: Option<u64>,
-
-    /// Maze height
-    #[arg(long, default_value = "30")]
-    rows: usize,
-
-    /// Maze width
-    #[arg(long, default_value = "30")]
-    cols: usize,
-
-    /// Output file
-    #[arg(short, long, default_value = "output.jsonl")]
-    output: String,
-
-    /// Number of threads (defaults to all cores)
-    #[arg(short, long)]
-    threads: Option<usize>,
-
-    /// Generator parameters as key=value pairs
-    #[arg(long = "param", value_parser = parse_key_val::<String, String>)]
-    params: Vec<(String, String)>,
-
-    /// List parameters for a specific generator or all generators
-    #[arg(long, value_name = "GENERATOR")]
-    list_params: Option<Option<GeneratorType>>,
-
-    /// Sample mazes with a uniform plan-length distribution (rejection sampling)
-    #[arg(long)]
-    balanced: bool,
-
-    /// Number of equal-width plan-length bins (only with --balanced)
-    #[arg(long, default_value = "10")]
-    num_bins: usize,
-
-    /// Minimum plan length for binning (only with --balanced; default: calibrated)
-    #[arg(long)]
-    min_len: Option<usize>,
-
-    /// Maximum plan length for binning (only with --balanced; default: calibrated)
-    #[arg(long)]
-    max_len: Option<usize>,
-
-    /// Calibration sample size used to auto-detect the length range (only with --balanced)
-    #[arg(long, default_value = "10000")]
-    calibration_samples: u64,
-
-    /// Upper-percentile trim for the calibrated max length, in [0, 1] (only with --balanced)
-    #[arg(long, default_value = "0.99")]
-    calibration_trim: f64,
-
-    /// Max generation attempts before giving up on unfilled bins (only with --balanced)
-    #[arg(long)]
-    max_attempts: Option<u64>,
-
-    /// Exit 0 even if some bins could not be filled (only with --balanced)
-    #[arg(long)]
-    allow_underfill: bool,
-}
-
-/// Parse key=value pairs
-fn parse_key_val<T, U>(
-    s: &str,
-) -> Result<(T, U), Box<dyn std::error::Error + Send + Sync + 'static>>
-where
-    T: std::str::FromStr,
-    T::Err: std::error::Error + Send + Sync + 'static,
-    U: std::str::FromStr,
-    U::Err: std::error::Error + Send + Sync + 'static,
-{
-    let pos = s
-        .find('=')
-        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{}`", s))?;
-    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
 }
 
 /// Batch size for serialization / sending to the writer.
 const BATCH_SIZE: usize = 1000;
 
-/// Shared maze-generation parameters; threaded through both run paths.
+/// Candidate generation chunk: bounds wasted work past a partition's target while keeping
+/// parallelism high. Leftovers carry over to the next partition, so nothing is thrown away
+/// except at the end of the run.
+const CHUNK: u64 = 8 * BATCH_SIZE as u64;
+
+/// Shared maze-generation parameters; threaded through the candidate stream.
 #[derive(Clone, Copy)]
 struct GenSpec<'a> {
     seed: u64,
@@ -154,13 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Extract required args (safe because of required_unless_present)
-    let generator = args.generator.expect("generator required");
-    let solver = args.solver.expect("solver required");
-    let count = args.count.expect("count required");
-
-    // Parse generator parameters
-    let generator_params = GeneratorParams::from_vec(args.params)?;
+    let validated = args.validate()?;
+    let generator_params = GeneratorParams::from_vec(args.params.clone())?;
 
     // Set thread pool size if specified
     if let Some(threads) = args.threads {
@@ -169,39 +86,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build_global()?;
     }
 
-    // Start timing
     let start_time = Instant::now();
-    println!("Generating {} mazes...", count);
+    println!(
+        "Generating {} mazes into {} ...",
+        validated.total_count(),
+        validated.output_dir
+    );
 
     let spec = GenSpec {
         seed: args.seed,
-        generator,
-        solver,
-        rows: args.rows,
-        cols: args.cols,
+        generator: validated.generator,
+        solver: validated.solver,
+        rows: validated.rows,
+        cols: validated.cols,
         params: &generator_params,
     };
 
-    if args.balanced {
-        let opts = BalancedOpts {
-            num_bins: args.num_bins,
-            min_len: args.min_len,
-            max_len: args.max_len,
-            calibration_samples: args.calibration_samples,
-            calibration_trim: args.calibration_trim,
-            max_attempts: args.max_attempts,
-            allow_underfill: args.allow_underfill,
-        };
-        run_balanced(spec, count, args.output, opts)?;
-    } else {
-        run_standard(spec, count, args.output)?;
-    }
+    let (emitted, attempts, duplicates) = run(spec, &args, &validated)?;
 
     let elapsed = start_time.elapsed();
-    let rate = count as f64 / elapsed.as_secs_f64();
-
+    let rate = emitted as f64 / elapsed.as_secs_f64();
     println!("\nCompleted in {:.2}s", elapsed.as_secs_f64());
-    println!("Generated {} mazes at {:.2} mazes/second", count, rate);
+    println!(
+        "Generated {} mazes at {:.2} mazes/second ({} candidates, {} duplicate layouts skipped)",
+        emitted, rate, attempts, duplicates
+    );
 
     Ok(())
 }
@@ -226,6 +135,232 @@ fn generate_one(spec: GenSpec, instance_id: u64) -> MazeResult {
         solver: spec.solver,
         seed: spec.seed,
     }
+}
+
+/// Generate a contiguous id range in parallel, preserving ascending id order.
+fn gen_chunk(spec: GenSpec, start: u64, end: u64) -> Vec<MazeResult> {
+    (start..end)
+        .into_par_iter()
+        .map(|id| generate_one(spec, id))
+        .collect()
+}
+
+/// The run's single source of candidate mazes, shared by every partition.
+///
+/// Candidates are produced in ascending instance-id order and consumed serially, so the output
+/// is byte-identical for the same args at any thread count. The seen-set spans the whole run:
+/// a layout claimed for eval can never be claimed again for test or train, which is what makes
+/// the splits disjoint by construction rather than by hoping two master seeds diverge.
+struct CandidateStream<'a> {
+    spec: GenSpec<'a>,
+    /// Generated-but-unconsumed candidates, ascending id order.
+    pending: VecDeque<MazeResult>,
+    /// Next instance id to generate.
+    next_id: u64,
+    /// Hard cap on generated candidates for the whole run.
+    max_attempts: u64,
+    seen: SeenSet,
+    /// Candidates rejected because their layout was already emitted.
+    duplicates: u64,
+}
+
+impl<'a> CandidateStream<'a> {
+    fn new(spec: GenSpec<'a>, max_attempts: u64, expected: u64) -> Self {
+        Self {
+            spec,
+            pending: VecDeque::new(),
+            next_id: 0,
+            max_attempts,
+            seen: SeenSet::with_capacity(expected as usize),
+            duplicates: 0,
+        }
+    }
+
+    /// Generate at least `count` candidates into `pending` without consuming them.
+    /// - Used by the balanced path to calibrate the plan-length range from the head of the
+    ///   stream; those same candidates are then consumed normally.
+    fn prefill(&mut self, count: u64) {
+        let have = self.pending.len() as u64;
+        if have >= count {
+            return;
+        }
+        let start = self.next_id;
+        let end = (start + (count - have)).min(self.max_attempts);
+        self.next_id = end;
+        self.pending.extend(gen_chunk(self.spec, start, end));
+    }
+
+    /// Next candidate in id order, or `None` once the attempt budget is spent.
+    fn next_candidate(&mut self) -> Option<MazeResult> {
+        loop {
+            if let Some(result) = self.pending.pop_front() {
+                return Some(result);
+            }
+            if self.next_id >= self.max_attempts {
+                return None;
+            }
+            let start = self.next_id;
+            let end = (start + CHUNK).min(self.max_attempts);
+            self.next_id = end;
+            self.pending.extend(gen_chunk(self.spec, start, end));
+        }
+    }
+
+    /// Claim a layout for emission; `false` when it was already emitted or excluded.
+    fn claim(&mut self, key: LayoutKey) -> bool {
+        if self.seen.claim(key) {
+            return true;
+        }
+        self.duplicates += 1;
+        false
+    }
+
+    /// Candidates examined so far (generated, minus the unused leftovers).
+    fn attempts(&self) -> u64 {
+        self.next_id - self.pending.len() as u64
+    }
+}
+
+/// The calibrated plan-length binning shared by every partition of a balanced run.
+struct BinSpec {
+    min_len: usize,
+    max_len: usize,
+    num_bins: usize,
+}
+
+impl BinSpec {
+    /// Resolve the binning: explicit `--min-len`/`--max-len`, else calibrated from the head of
+    /// the candidate stream.
+    fn calibrate(stream: &mut CandidateStream, opts: BalancedOpts) -> Result<Self, String> {
+        let (min_len, max_len) = match (opts.min_len, opts.max_len) {
+            (Some(lo), Some(hi)) => (lo, hi),
+            _ => {
+                let samples = opts.calibration_samples.max(1);
+                println!("Calibrating plan-length range from {} samples...", samples);
+                stream.prefill(samples);
+                let lens: Vec<usize> = stream
+                    .pending
+                    .iter()
+                    .take(samples as usize)
+                    .map(|r| r.solution.path.len())
+                    .filter(|&l| l > 0)
+                    .collect();
+                if lens.is_empty() {
+                    return Err("Calibration produced no solvable mazes".into());
+                }
+                let observed_min = *lens.iter().min().unwrap();
+                let observed_max = balanced::percentile(&lens, opts.calibration_trim).unwrap();
+                let lo = opts.min_len.unwrap_or(observed_min);
+                let hi = opts.max_len.unwrap_or(observed_max.max(lo));
+                (lo, hi)
+            }
+        };
+        if max_len < min_len {
+            return Err(format!(
+                "--max-len ({}) must be >= --min-len ({})",
+                max_len, min_len
+            ));
+        }
+
+        // Clamp num_bins to the integer-length width so every bin is fillable.
+        let num_bins = balanced::clamp_num_bins(opts.num_bins, min_len, max_len);
+        if num_bins != opts.num_bins {
+            eprintln!(
+                "Warning: plan-length range [{}, {}] has only {} integer lengths; \
+                 clamping --num-bins from {} to {}.",
+                min_len,
+                max_len,
+                max_len - min_len + 1,
+                opts.num_bins,
+                num_bins
+            );
+        }
+        println!(
+            "Balanced sampling: num_bins={} range=[{}, {}]",
+            num_bins, min_len, max_len
+        );
+        Ok(Self {
+            min_len,
+            max_len,
+            num_bins,
+        })
+    }
+}
+
+/// Path of a partition file inside the dataset directory.
+fn partition_path(dir: &str, kind: PartitionKind) -> String {
+    Path::new(dir)
+        .join(format!("{}.jsonl", kind.stem()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Create the dataset directory and refuse to clobber an existing partition file.
+///
+/// The whole point of a dataset is disjointness; overwriting a split another run depends on
+/// would silently break that, so an existing target file is a hard error, not a truncation.
+fn prepare_output_dir(
+    dir: &str,
+    partitions: &[Partition],
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("--output {dir}: {e}"))?;
+    for part in partitions {
+        let path = partition_path(dir, part.kind);
+        if Path::new(&path).exists() {
+            return Err(format!(
+                "refusing to overwrite existing partition file {path} \
+                 (remove it or choose another --output directory)"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Dump the parsed CLI args as `args.json` in the dataset directory.
+///
+/// - Written after the clobber checks, so a refused run leaves the directory untouched.
+/// - Overwrites: the file records the invocation that last wrote into the directory.
+fn write_args_json(dir: &str, args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(dir).join("args.json");
+    let json = serde_json::to_string_pretty(args)?;
+    std::fs::write(&path, json + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Pre-seed the seen-set from an existing dataset directory (`--exclude`).
+fn load_exclusions(
+    stream: &mut CandidateStream,
+    dir: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = exclude::partition_files_in(dir);
+    if paths.is_empty() {
+        return Err(format!(
+            "--exclude {dir}: no eval.jsonl / test.jsonl / train.jsonl found \
+             (excluding nothing is never what you meant)"
+        )
+        .into());
+    }
+    let started = Instant::now();
+    let mut excluded: u64 = 0;
+    let stats = exclude::scan_files(&paths, rows, cols, |key| {
+        if stream.seen.claim(key) {
+            excluded += 1;
+        }
+    })?;
+    let skipped = match stats.skipped_dims {
+        0 => String::new(),
+        n => format!(", {n} not {rows}x{cols}"),
+    };
+    eprintln!(
+        "Excluding {excluded} layouts read from {} file(s) ({} lines{skipped}) in {:.2}s",
+        paths.len(),
+        stats.lines,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Spawn the writer thread; payload carries a maze count for accurate progress.
@@ -254,7 +389,6 @@ fn spawn_writer(
             writer.write_all(&batch.bytes)?;
             total_written += batch.n;
             progress.set_position(total_written);
-            writer.flush()?;
         }
         writer.flush()?;
         progress.finish_with_message("All mazes written!");
@@ -263,215 +397,186 @@ fn spawn_writer(
     (tx, handle)
 }
 
-/// Standard path: generate exactly `count` mazes in id order.
-/// - Output is identical to the pre-`--balanced` behaviour.
-fn run_standard(
-    spec: GenSpec,
-    count: u64,
-    output: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (tx, writer_handle) = spawn_writer(output, count);
-
-    // Process mazes in batches
-    (0..count)
-        .step_by(BATCH_SIZE)
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .for_each_with(tx, |tx, batch_start| {
-            let batch_end = (batch_start + BATCH_SIZE as u64).min(count);
-            let mut batch_results: Vec<MazeResult> = Vec::with_capacity(BATCH_SIZE);
-            for instance_id in batch_start..batch_end {
-                batch_results.push(generate_one(spec, instance_id));
-            }
-            let bytes = process_batch(&batch_results);
-            tx.send(Batch {
-                bytes,
-                n: batch_results.len() as u64,
-            })
-            .unwrap();
-        });
-
-    writer_handle.join().unwrap()?;
-    Ok(())
+/// Serialize and send a batch, clearing the buffer.
+fn flush_batch(tx: &SyncSender<Batch>, buffer: &mut Vec<MazeResult>) {
+    if buffer.is_empty() {
+        return;
+    }
+    let bytes = process_batch(buffer);
+    tx.send(Batch {
+        bytes,
+        n: buffer.len() as u64,
+    })
+    .expect("writer thread alive");
+    buffer.clear();
 }
 
-/// Options for the balanced sampling path.
-struct BalancedOpts {
-    num_bins: usize,
-    min_len: Option<usize>,
-    max_len: Option<usize>,
-    calibration_samples: u64,
-    calibration_trim: f64,
-    max_attempts: Option<u64>,
-    allow_underfill: bool,
+/// What one partition managed to emit, and how its bins filled up.
+struct PartitionOutcome {
+    emitted: u64,
+    caps: Vec<u64>,
+    filled: Vec<u64>,
 }
 
-/// Balanced path: rejection-sample to a uniform plan-length histogram.
-/// - Deterministic: candidates accepted in ascending id order, independent of thread count.
-/// - Total output == count when feasible; otherwise reports per-bin deficits.
-fn run_balanced(
-    spec: GenSpec,
-    count: u64,
-    output: String,
-    opts: BalancedOpts,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Generation chunk size: bounds wasted work past target while keeping parallelism high.
-    const CHUNK: u64 = 8 * BATCH_SIZE as u64;
-
-    if opts.num_bins < 1 {
-        return Err("--num-bins must be >= 1".into());
-    }
-
-    // Order-preserving parallel generation of a contiguous id range.
-    let gen_chunk = |start: u64, end: u64| -> Vec<MazeResult> {
-        (start..end)
-            .into_par_iter()
-            .map(|id| generate_one(spec, id))
-            .collect()
+/// Generate one partition file from the shared candidate stream.
+///
+/// Acceptance order: bin first, then layout. A candidate rejected for a full bin keeps its
+/// layout available for a later partition; only an emitted maze burns its layout.
+fn generate_partition(
+    stream: &mut CandidateStream,
+    part: Partition,
+    path: &str,
+    bins: Option<&BinSpec>,
+) -> Result<PartitionOutcome, Box<dyn std::error::Error>> {
+    let caps = match bins {
+        Some(b) => balanced::compute_caps(part.count, b.num_bins),
+        None => vec![part.count],
     };
+    let mut filled = vec![0u64; caps.len()];
+    let mut emitted: u64 = 0;
 
-    // Calibrate the plan-length range; reuse the samples as the first candidates.
-    let mut pending: Vec<MazeResult> = Vec::new();
-    let mut next_id: u64 = 0;
-    let (min_len, max_len) = match (opts.min_len, opts.max_len) {
-        (Some(lo), Some(hi)) => (lo, hi),
-        _ => {
-            let s = opts.calibration_samples.max(1);
-            println!("Calibrating plan-length range from {} samples...", s);
-            pending = gen_chunk(0, s);
-            next_id = s;
-            let lens: Vec<usize> = pending
-                .iter()
-                .map(|r| r.solution.path.len())
-                .filter(|&l| l > 0)
-                .collect();
-            if lens.is_empty() {
-                return Err("Calibration produced no solvable mazes".into());
-            }
-            let obs_min = *lens.iter().min().unwrap();
-            let obs_max = balanced::percentile(&lens, opts.calibration_trim).unwrap();
-            let lo = opts.min_len.unwrap_or(obs_min);
-            let hi = opts.max_len.unwrap_or(obs_max.max(lo));
-            (lo, hi)
-        }
-    };
-
-    if max_len < min_len {
-        return Err(format!("--max-len ({}) must be >= --min-len ({})", max_len, min_len).into());
-    }
-
-    // Clamp num_bins to the integer-length width so every bin is fillable.
-    let num_bins = balanced::clamp_num_bins(opts.num_bins, min_len, max_len);
-    if num_bins != opts.num_bins {
-        eprintln!(
-            "Warning: plan-length range [{}, {}] has only {} integer lengths; \
-             clamping --num-bins from {} to {}.",
-            min_len,
-            max_len,
-            max_len - min_len + 1,
-            opts.num_bins,
-            num_bins
-        );
-    }
-
-    let caps = balanced::compute_caps(count, num_bins);
-    let max_attempts = opts.max_attempts.unwrap_or_else(|| {
-        count
-            .saturating_mul(num_bins as u64)
-            .saturating_mul(100)
-            .max(count)
-    });
-
-    println!(
-        "Balanced sampling: count={} num_bins={} range=[{}, {}] max_attempts={}",
-        count, num_bins, min_len, max_len, max_attempts
-    );
-
-    let (tx, writer_handle) = spawn_writer(output, count);
-
-    // Serial, deterministic accept state.
-    let mut filled = vec![0u64; num_bins];
-    let mut total_accepted: u64 = 0;
+    let (tx, writer_handle) = spawn_writer(path.to_string(), part.count);
     let mut out_buffer: Vec<MazeResult> = Vec::with_capacity(BATCH_SIZE);
 
-    'outer: loop {
-        // Refill candidates in ascending id order if needed.
-        if pending.is_empty() {
-            if next_id >= max_attempts {
-                break;
-            }
-            let start = next_id;
-            let end = (start + CHUNK).min(max_attempts);
-            next_id = end;
-            pending = gen_chunk(start, end);
-        }
-
-        // Serial accept pass (pending is in ascending id order).
-        for result in pending.drain(..) {
-            let len = result.solution.path.len();
-            if let Some(b) = balanced::bin_index(len, min_len, max_len, num_bins) {
-                if filled[b] < caps[b] {
-                    filled[b] += 1;
-                    total_accepted += 1;
-                    out_buffer.push(result);
-                    if out_buffer.len() >= BATCH_SIZE {
-                        let bytes = process_batch(&out_buffer);
-                        tx.send(Batch {
-                            bytes,
-                            n: out_buffer.len() as u64,
-                        })
-                        .unwrap();
-                        out_buffer.clear();
-                    }
-                    if total_accepted >= count {
-                        break 'outer;
-                    }
+    while emitted < part.count {
+        let Some(result) = stream.next_candidate() else {
+            break;
+        };
+        let bin = match bins {
+            Some(b) => {
+                match balanced::bin_index(
+                    result.solution.path.len(),
+                    b.min_len,
+                    b.max_len,
+                    b.num_bins,
+                ) {
+                    Some(bin) => bin,
+                    None => continue,
                 }
             }
+            None => 0,
+        };
+        if filled[bin] >= caps[bin] {
+            continue;
+        }
+        if !stream.claim(layout_key(&result.maze)) {
+            continue;
+        }
+        filled[bin] += 1;
+        emitted += 1;
+        out_buffer.push(result);
+        if out_buffer.len() >= BATCH_SIZE {
+            flush_batch(&tx, &mut out_buffer);
         }
     }
 
-    // Flush remaining accepted mazes.
-    if !out_buffer.is_empty() {
-        let bytes = process_batch(&out_buffer);
-        tx.send(Batch {
-            bytes,
-            n: out_buffer.len() as u64,
-        })
-        .unwrap();
-    }
+    flush_batch(&tx, &mut out_buffer);
     drop(tx);
-    writer_handle.join().unwrap()?;
+    writer_handle.join().expect("writer thread joins")?;
 
-    // Under-fill handling: report per-bin deficits; no silent truncation.
-    if total_accepted < count {
-        let ranges = balanced::bin_ranges(min_len, max_len, num_bins);
+    Ok(PartitionOutcome {
+        emitted,
+        caps,
+        filled,
+    })
+}
+
+/// Report per-bin deficits for a partition that could not be filled; no silent truncation.
+fn report_underfill(
+    part: Partition,
+    outcome: &PartitionOutcome,
+    bins: Option<&BinSpec>,
+    attempts: u64,
+    duplicates: u64,
+) {
+    eprintln!(
+        "\nUnder-filled {} after {} candidates (emitted {}/{}, {} duplicate layouts skipped):",
+        part.kind.stem(),
+        attempts,
+        outcome.emitted,
+        part.count,
+        duplicates
+    );
+    let Some(bins) = bins else {
+        return;
+    };
+    let ranges = balanced::bin_ranges(bins.min_len, bins.max_len, bins.num_bins);
+    eprintln!("  bin  range        cap   filled  deficit");
+    for (b, bin_range) in ranges.iter().enumerate() {
+        let range = match bin_range {
+            Some((lo, hi)) => format!("[{}, {}]", lo, hi),
+            None => "-".to_string(),
+        };
+        let deficit = outcome.caps[b].saturating_sub(outcome.filled[b]);
         eprintln!(
-            "\nUnder-filled after {} attempts (accepted {}/{}):",
-            next_id, total_accepted, count
+            "  {:>3}  {:<11}  {:>4}   {:>6}  {:>7}",
+            b, range, outcome.caps[b], outcome.filled[b], deficit
         );
-        eprintln!("  bin  range        cap   filled  deficit");
-        for b in 0..num_bins {
-            let range = match ranges[b] {
-                Some((lo, hi)) => format!("[{}, {}]", lo, hi),
-                None => "-".to_string(),
-            };
-            let deficit = caps[b].saturating_sub(filled[b]);
-            eprintln!(
-                "  {:>3}  {:<11}  {:>4}   {:>6}  {:>7}",
-                b, range, caps[b], filled[b], deficit
+    }
+}
+
+/// Generate the whole dataset: every requested partition in the fixed eval → test → train
+/// order, sharing one candidate stream and seen-set so the splits are mutually layout-disjoint.
+///
+/// Returns `(emitted, candidates generated, duplicate layouts skipped)`.
+fn run(
+    spec: GenSpec,
+    args: &Args,
+    validated: &Validated,
+) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
+    prepare_output_dir(&validated.output_dir, &validated.partitions)?;
+    write_args_json(&validated.output_dir, args)?;
+
+    let mut stream = CandidateStream::new(spec, validated.max_attempts, validated.total_count());
+    if let Some(dir) = &validated.exclude_dir {
+        load_exclusions(&mut stream, dir, validated.rows, validated.cols)?;
+    }
+
+    let bins = match validated.balanced {
+        Some(opts) => Some(BinSpec::calibrate(&mut stream, opts)?),
+        None => None,
+    };
+
+    let mut total: u64 = 0;
+    for &part in &validated.partitions {
+        let path = partition_path(&validated.output_dir, part.kind);
+        println!("  {} -> {path} ({} mazes)...", part.kind.stem(), part.count);
+        let outcome = generate_partition(&mut stream, part, &path, bins.as_ref())?;
+        total += outcome.emitted;
+        if outcome.emitted < part.count {
+            report_underfill(
+                part,
+                &outcome,
+                bins.as_ref(),
+                stream.attempts(),
+                stream.duplicates,
             );
-        }
-        if !opts.allow_underfill {
-            return Err(format!(
-                "Balanced sampling under-filled: {}/{} mazes after {} attempts. \
-                 Reduce --num-bins, lower --max-len, or raise --max-attempts \
-                 (or pass --allow-underfill).",
-                total_accepted, count, next_id
-            )
-            .into());
+            if !validated.allow_underfill {
+                // Tailor the hint: a balanced run usually starves a bin, an unbalanced one has
+                // run out of distinct layouts for this grid.
+                let hint = match bins {
+                    Some(_) => {
+                        "Reduce --num-bins, lower --max-len, or raise --max-attempts \
+                         (or pass --allow-underfill)."
+                    }
+                    None => {
+                        "The grid admits too few distinct layouts; enlarge --rows/--cols, \
+                         lower the counts, or raise --max-attempts (or pass --allow-underfill)."
+                    }
+                };
+                return Err(format!(
+                    "Under-filled {}: {}/{} mazes after {} candidates. {hint}",
+                    part.kind.stem(),
+                    outcome.emitted,
+                    part.count,
+                    stream.attempts()
+                )
+                .into());
+            }
+            // The stream is spent; later partitions cannot do better.
+            break;
         }
     }
 
-    Ok(())
+    Ok((total, stream.attempts(), stream.duplicates))
 }

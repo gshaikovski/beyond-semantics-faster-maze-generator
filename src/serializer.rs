@@ -1,7 +1,8 @@
 use crate::types::{MazeResult, ReasoningEvent};
 use crate::{GeneratorType, SolverType};
-use std::io::Write;
+use rayon::prelude::*;
 use std::fmt::Write as FmtWrite;
+use std::io::Write;
 
 /// Write a maze result directly to a writer as JSON
 pub fn write_maze_json<W: Write>(
@@ -111,17 +112,36 @@ thread_local! {
 }
 
 
-/// Process a batch of maze results and write them to a byte vector
-pub fn process_batch(results: &[MazeResult]) -> Vec<u8> {
+/// Serialize a contiguous run of maze results into one byte buffer.
+fn serialize_run(results: &[MazeResult]) -> Vec<u8> {
     FORMAT_BUFFER.with(|buf_cell| {
         let mut buffer = buf_cell.borrow_mut();
         // Use 8KB per maze
         let mut output = Vec::with_capacity(results.len() * 8192);
-        
+
         for result in results {
             write_maze_json(&mut output, result, &mut buffer).unwrap();
         }
-        
+
         output
     })
+}
+
+/// Sub-chunk size for parallel serialization; small enough to spread a batch over the pool.
+const SERIALIZE_CHUNK: usize = 32;
+
+/// Process a batch of maze results and write them to a byte vector.
+///
+/// Records are accepted serially (that is what makes the output deterministic), so formatting
+/// them there would idle every other core on a large run. Sub-chunks are serialized on the
+/// rayon pool and concatenated in order, which keeps the bytes identical either way.
+pub fn process_batch(results: &[MazeResult]) -> Vec<u8> {
+    if results.len() <= SERIALIZE_CHUNK {
+        return serialize_run(results);
+    }
+    let chunks: Vec<Vec<u8>> = results
+        .par_chunks(SERIALIZE_CHUNK)
+        .map(serialize_run)
+        .collect();
+    chunks.concat()
 }
