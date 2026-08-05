@@ -22,6 +22,20 @@ impl Maze {
         }
     }
     
+    /// Create a new maze with every cell a floor.
+    ///
+    /// The starting point for reading a maze back from a record: walls are punched into it as
+    /// they are parsed, which is far cheaper than setting every cell.
+    pub fn all_floor(rows: usize, cols: usize) -> Self {
+        let mut maze = Maze::new(rows, cols);
+        for y in 0..rows {
+            for x in 0..cols {
+                maze.set_cell(x, y, true);
+            }
+        }
+        maze
+    }
+
     /// Get cell value (true = floor, false = wall)
     #[inline(always)]
     pub fn get_cell(&self, x: usize, y: usize) -> bool {
