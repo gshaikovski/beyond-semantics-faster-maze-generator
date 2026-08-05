@@ -3,8 +3,10 @@ mod cli;
 mod dedup;
 mod exclude;
 mod generators;
+mod jsonl;
 mod parameters;
 mod prng;
+mod resolve;
 mod serializer;
 mod solvers;
 mod types;
@@ -21,7 +23,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread;
 use std::time::Instant;
 
-use crate::cli::{Args, BalancedOpts, Partition, PartitionKind, Validated};
+use crate::cli::{Args, BalancedOpts, Mode, Partition, PartitionKind, Validated};
 use crate::dedup::{layout_key, LayoutKey, SeenSet};
 use crate::parameters::{print_all_params_help, print_param_help, GeneratorParams};
 use crate::prng::create_instance_prng;
@@ -38,7 +40,7 @@ pub enum GeneratorType {
     DrunkardsWalk,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, ValueEnum, Hash, PartialEq, Eq, Serialize)]
 pub enum SolverType {
     #[value(name = "astar")]
     #[serde(rename = "astar")]
@@ -76,15 +78,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let validated = args.validate()?;
-    let generator_params = GeneratorParams::from_vec(args.params.clone())?;
-
-    // Set thread pool size if specified
+    // Set thread pool size if specified; sizes both modes, and may only be set once.
     if let Some(threads) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build_global()?;
     }
+
+    let validated = match args.mode()? {
+        Mode::Resolve(opts) => return resolve::run(&opts),
+        Mode::Generate(validated) => *validated,
+    };
+    let generator_params = GeneratorParams::from_vec(args.params.clone())?;
 
     let start_time = Instant::now();
     println!(
