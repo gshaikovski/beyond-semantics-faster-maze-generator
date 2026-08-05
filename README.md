@@ -85,3 +85,19 @@ The tool outputs mazes in JSONL format (one JSON object per line). This should b
 - `seed`: Random seed used
 - `rows`: Maze height
 - `cols`: Maze width
+
+#### Where the query block sits
+
+`text` puts the `query start ... goal ...` block **after** the wall list, immediately before `reasoning`:
+
+```
+wall 1 0 wall 0 2 query start 0 0 goal 2 2 reasoning close ... solution plan ... end
+```
+
+The query then sits next to the trace it conditions rather than being separated from it by the whole maze body, which for a large grid is most of the prompt. `--legacy-query-first` restores the original layout:
+
+```
+query start 0 0 goal 2 2 wall 1 0 wall 0 2 reasoning close ... solution plan ... end
+```
+
+Only the order changes — same tokens, same wall order, same trace. `--exclude` reads either layout, and the flag is recorded in `args.json`.

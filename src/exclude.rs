@@ -100,7 +100,8 @@ fn parse_line(
         return Ok(None);
     }
 
-    // Walls live between the query header and the trace; the trace is the bulk of the line.
+    // Walls live in the prompt, whichever side of it the query block sits on (see
+    // `QueryPlacement`); the trace is the bulk of the line, so only the prompt is scanned.
     let head = match text.split_once(TRACE_MARKER) {
         Some((head, _)) => head,
         None => return Err("no ` reasoning` marker in \"text\"".into()),
@@ -181,10 +182,17 @@ where
 mod tests {
     use super::*;
     use crate::dedup::layout_key;
+    use crate::serializer::{process_batch, QueryPlacement};
+    use crate::types::{MazeResult, Solution};
+    use crate::{GeneratorType, SolverType};
     use std::io::Write;
 
-    /// A 3x3 record with walls at (1,0) and (0,2), as the serializer would emit it.
-    const LINE: &str = r#"{"idx":7,"text":"query start 0 0 goal 2 2 wall 1 0 wall 0 2 reasoning create 0 0 c0 c4 close 0 0 c0 c4 solution plan 0 0 plan 2 2 end","generator":"wilson","solver":"astar","seed":1,"rows":3,"cols":3}"#;
+    /// A 3x3 record with walls at (1,0) and (0,2), as the serializer emits it by default
+    /// (query block after the wall list).
+    const LINE: &str = r#"{"idx":7,"text":"wall 1 0 wall 0 2 query start 0 0 goal 2 2 reasoning create 0 0 c0 c4 close 0 0 c0 c4 solution plan 0 0 plan 2 2 end","generator":"wilson","solver":"astar","seed":1,"rows":3,"cols":3}"#;
+
+    /// The same record in the legacy `--legacy-query-first` layout.
+    const LEGACY_LINE: &str = r#"{"idx":7,"text":"query start 0 0 goal 2 2 wall 1 0 wall 0 2 reasoning create 0 0 c0 c4 close 0 0 c0 c4 solution plan 0 0 plan 2 2 end","generator":"wilson","solver":"astar","seed":1,"rows":3,"cols":3}"#;
 
     fn maze_3x3(walls: &[(usize, usize)]) -> Maze {
         let mut maze = Maze::new(3, 3);
@@ -235,8 +243,56 @@ mod tests {
             .unwrap_err()
             .contains("outside"));
         // Truncated coordinate pair.
-        let truncated = LINE.replace("wall 0 2 reasoning", "wall 0 reasoning");
+        let truncated = LINE.replace("wall 0 2 query", "wall 0 query");
         assert!(parse_line(&truncated, 3, 3, &template).is_err());
+    }
+
+    #[test]
+    fn both_query_placements_key_the_same_layout() {
+        // Exclusion must work against datasets written in either text layout.
+        let template = floor_template(3, 3);
+        let expected = layout_key(&maze_3x3(&[(1, 0), (0, 2)]));
+        assert_eq!(
+            parse_line(LINE, 3, 3, &template).unwrap().unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_line(LEGACY_LINE, 3, 3, &template).unwrap().unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn serializer_output_round_trips() {
+        // Guards the hand-written parser against a change in what the writer emits.
+        let walls = [(1, 0), (0, 2)];
+        let mut maze = maze_3x3(&walls);
+        maze.start = (0, 0);
+        maze.goal = (2, 2);
+        let expected = layout_key(&maze);
+        let result = MazeResult {
+            instance_id: 0,
+            maze,
+            solution: Solution {
+                path: vec![(0, 0)],
+                reasoning: Vec::new(),
+            },
+            generator: GeneratorType::Wilson,
+            solver: SolverType::AStar,
+            seed: 0,
+        };
+        let template = floor_template(3, 3);
+        for placement in [QueryPlacement::AfterWalls, QueryPlacement::First] {
+            let bytes = process_batch(std::slice::from_ref(&result), placement);
+            let line = String::from_utf8(bytes).unwrap();
+            assert_eq!(
+                parse_line(line.trim_end(), 3, 3, &template)
+                    .unwrap()
+                    .unwrap(),
+                expected,
+                "placement {placement:?}"
+            );
+        }
     }
 
     fn write_tmp(tag: &str, body: &str) -> String {

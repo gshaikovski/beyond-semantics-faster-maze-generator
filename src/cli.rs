@@ -1,5 +1,6 @@
 //! Command-line interface: argument parsing, validation, and dataset partitions.
 
+use crate::serializer::QueryPlacement;
 use crate::{GeneratorType, SolverType};
 use clap::Parser;
 use serde::Serialize;
@@ -67,6 +68,8 @@ pub struct Validated {
     pub allow_underfill: bool,
     /// Dataset directory whose layouts must not be re-emitted (None when `--exclude` absent).
     pub exclude_dir: Option<String>,
+    /// Where the `query start ... goal ...` block sits in the emitted `text`.
+    pub query_placement: QueryPlacement,
 }
 
 impl Validated {
@@ -165,6 +168,11 @@ pub struct Args {
     /// partition files is emitted again (matched by walls alone, whatever the start/goal)
     #[arg(long)]
     pub exclude: Option<String>,
+
+    /// Emit the legacy text layout, `query start ... goal ...` before the wall list
+    /// (default: the query block follows the walls, just before `reasoning`)
+    #[arg(long)]
+    pub legacy_query_first: bool,
 }
 
 /// Parse key=value pairs
@@ -241,6 +249,10 @@ impl Args {
             max_attempts,
             allow_underfill: self.allow_underfill,
             exclude_dir,
+            query_placement: match self.legacy_query_first {
+                true => QueryPlacement::First,
+                false => QueryPlacement::AfterWalls,
+            },
         })
     }
 
@@ -319,6 +331,7 @@ mod tests {
             max_attempts: None,
             allow_underfill: false,
             exclude: None,
+            legacy_query_first: false,
         }
     }
 
@@ -400,6 +413,17 @@ mod tests {
         assert!(a.validate().is_ok());
         a.calibration_trim = 1.5;
         assert!(a.validate().unwrap_err().contains("--calibration-trim"));
+    }
+
+    #[test]
+    fn query_follows_the_walls_unless_the_legacy_flag_is_set() {
+        let mut a = args(None, None, Some(5));
+        assert_eq!(
+            a.validate().unwrap().query_placement,
+            QueryPlacement::AfterWalls
+        );
+        a.legacy_query_first = true;
+        assert_eq!(a.validate().unwrap().query_placement, QueryPlacement::First);
     }
 
     #[test]

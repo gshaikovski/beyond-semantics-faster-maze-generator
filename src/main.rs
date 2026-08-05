@@ -25,7 +25,7 @@ use crate::cli::{Args, BalancedOpts, Partition, PartitionKind, Validated};
 use crate::dedup::{layout_key, LayoutKey, SeenSet};
 use crate::parameters::{print_all_params_help, print_param_help, GeneratorParams};
 use crate::prng::create_instance_prng;
-use crate::serializer::process_batch;
+use crate::serializer::{process_batch, QueryPlacement};
 use crate::types::MazeResult;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Hash, Serialize)]
@@ -398,11 +398,11 @@ fn spawn_writer(
 }
 
 /// Serialize and send a batch, clearing the buffer.
-fn flush_batch(tx: &SyncSender<Batch>, buffer: &mut Vec<MazeResult>) {
+fn flush_batch(tx: &SyncSender<Batch>, buffer: &mut Vec<MazeResult>, placement: QueryPlacement) {
     if buffer.is_empty() {
         return;
     }
-    let bytes = process_batch(buffer);
+    let bytes = process_batch(buffer, placement);
     tx.send(Batch {
         bytes,
         n: buffer.len() as u64,
@@ -427,6 +427,7 @@ fn generate_partition(
     part: Partition,
     path: &str,
     bins: Option<&BinSpec>,
+    placement: QueryPlacement,
 ) -> Result<PartitionOutcome, Box<dyn std::error::Error>> {
     let caps = match bins {
         Some(b) => balanced::compute_caps(part.count, b.num_bins),
@@ -466,11 +467,11 @@ fn generate_partition(
         emitted += 1;
         out_buffer.push(result);
         if out_buffer.len() >= BATCH_SIZE {
-            flush_batch(&tx, &mut out_buffer);
+            flush_batch(&tx, &mut out_buffer, placement);
         }
     }
 
-    flush_batch(&tx, &mut out_buffer);
+    flush_batch(&tx, &mut out_buffer, placement);
     drop(tx);
     writer_handle.join().expect("writer thread joins")?;
 
@@ -541,7 +542,13 @@ fn run(
     for &part in &validated.partitions {
         let path = partition_path(&validated.output_dir, part.kind);
         println!("  {} -> {path} ({} mazes)...", part.kind.stem(), part.count);
-        let outcome = generate_partition(&mut stream, part, &path, bins.as_ref())?;
+        let outcome = generate_partition(
+            &mut stream,
+            part,
+            &path,
+            bins.as_ref(),
+            validated.query_placement,
+        )?;
         total += outcome.emitted;
         if outcome.emitted < part.count {
             report_underfill(
