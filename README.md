@@ -72,6 +72,55 @@ Consequences worth knowing:
 
 Records whose grid shape differs from the current `--rows`/`--cols` are skipped (they cannot collide); an unparsable line is a hard error, since silently ignoring one would leave the datasets overlapping.
 
+## Re-solving an existing file (`--puzzle-file`)
+
+`--puzzle-file <path.jsonl>` reads mazes instead of generating them: each record is re-solved
+with this crate's A\* and written to `<dir>/<stem>_resolved.jsonl` beside the input.
+
+```bash
+./target/release/maze_gen_fast --puzzle-file /data/datasets/maze_wilson_20/test_looped.jsonl
+# -> /data/datasets/maze_wilson_20/test_looped_resolved.jsonl
+```
+
+**Everything except the trace and the plan is copied verbatim** — every JSON key, its value and
+its position, including keys this tool knows nothing about, and inside `text` every byte before
+` reasoning`. Only the search trace and the plan are replaced. The line is spliced rather than
+re-encoded, so key order survives and the record needs no round-trip through a JSON parser.
+
+The motivating case is a file whose stored trace has gone stale — e.g. `test_looped.jsonl`,
+where a wall was deleted from `text` but the trace and plan still describe the route from before
+the deletion. The run reports what moved:
+
+```
+Resolved 740 records into …/test_looped_resolved.jsonl in 0.01s
+  0/740 unchanged (the stored trace and plan already match this A*)
+  plan:  shorter 740, longer 0 (mean -19.7 steps over the 740 changed)
+  trace: shorter 740, longer 0 (mean -104.8 events over the 740 changed)
+```
+
+Because A\* is deterministic, re-solving an unmodified file is a no-op: the output is
+byte-identical to the input, and the summary says so.
+
+Worth knowing:
+
+- **Nothing else is written.** No `args.json`, no sidecar — a source dataset's provenance is
+  never touched. The output is built under a temporary name and renamed into place only on
+  success, so an aborted run leaves no partial file. An existing `_resolved.jsonl` is never
+  overwritten.
+- **Any record that fails aborts the whole run**, naming the file and line: no start→goal path,
+  no `rows`/`cols` keys (dimensions cannot be safely inferred), a start or goal on a wall, an
+  unrecognised token in the maze spec. A file is either fully re-solved or not written at all.
+- Both text layouts are read (query-first and walls-first) and the input's layout is preserved,
+  since the prompt bytes are never rewritten.
+- The record's own `solver` field is copied, not consulted; re-solving always uses this crate's
+  A\*. `seed`, `generator` and `idx` are likewise preserved and, after a re-solve, no longer
+  describe the trace in the record.
+- Records must be compact JSON (`{"key":value}`). A file written with Python's default
+  `json.dumps` spacing is rejected — the same limitation `--exclude` has.
+- `--puzzle-file` conflicts with the generation arguments (`--generator`, `--output`,
+  `--train/--test/--eval`, `--balanced`, `--exclude`, …) rather than ignoring them.
+  `--threads` still sizes the pool.
+
 ## Determinism
 
 Candidates are generated in parallel but accepted serially in ascending instance-id order, so output is byte-identical for the same arguments at any `--threads`. `idx` keeps the generating instance id, which stays ascending (and sparse when candidates are rejected).

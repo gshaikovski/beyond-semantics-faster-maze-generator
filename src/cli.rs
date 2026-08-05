@@ -4,6 +4,7 @@ use crate::serializer::QueryPlacement;
 use crate::{GeneratorType, SolverType};
 use clap::Parser;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 /// A dataset partition. Order of the variants is the hardcoded generation order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,16 +80,44 @@ impl Validated {
     }
 }
 
+/// Validated configuration for `--puzzle-file`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResolveOpts {
+    /// Puzzle files to re-solve, in the order given.
+    pub inputs: Vec<PathBuf>,
+    /// Solver to re-solve with; the record's own `solver` field is not consulted.
+    pub solver: SolverType,
+}
+
+/// What this invocation does. Exactly one of the two, decided by `--puzzle-file`.
+#[derive(Debug)]
+pub enum Mode {
+    /// Generate a dataset directory.
+    Generate(Box<Validated>),
+    /// Re-solve an existing puzzle file.
+    Resolve(ResolveOpts),
+}
+
 #[derive(Parser, Serialize)]
 #[command(name = "maze_gen_fast")]
 #[command(about = "Parallel maze generation with hierarchical PRNG")]
 pub struct Args {
     /// Generator algorithm
-    #[arg(short, long, value_enum, required_unless_present = "list_params")]
+    #[arg(
+        short,
+        long,
+        value_enum,
+        required_unless_present_any = ["list_params", "puzzle_file"]
+    )]
     pub generator: Option<GeneratorType>,
 
     /// Solver algorithm
-    #[arg(short, long, value_enum, required_unless_present = "list_params")]
+    #[arg(
+        short,
+        long,
+        value_enum,
+        required_unless_present_any = ["list_params", "puzzle_file"]
+    )]
     pub solver: Option<SolverType>,
 
     /// Master seed for PRNG
@@ -104,7 +133,7 @@ pub struct Args {
     pub cols: usize,
 
     /// Dataset directory; partition files (eval.jsonl, test.jsonl, train.jsonl) are written here
-    #[arg(short, long, required_unless_present = "list_params")]
+    #[arg(short, long, required_unless_present_any = ["list_params", "puzzle_file"])]
     pub output: Option<String>,
 
     /// Number of eval mazes; omit to skip the split
@@ -173,6 +202,16 @@ pub struct Args {
     /// (default: the query block follows the walls, just before `reasoning`)
     #[arg(long)]
     pub legacy_query_first: bool,
+
+    /// Re-solve an existing maze JSONL instead of generating one: writes
+    /// <dir>/<stem>_resolved.jsonl with a fresh A* trace and optimal plan per record, every
+    /// other JSON key copied verbatim
+    #[arg(long, conflicts_with_all = [
+        "list_params", "generator", "output", "eval", "test", "train",
+        "balanced", "exclude", "params", "legacy_query_first",
+        "max_attempts", "allow_underfill",
+    ])]
+    pub puzzle_file: Option<String>,
 }
 
 /// Parse key=value pairs
@@ -199,6 +238,39 @@ const MIN_GRID: usize = 4;
 const ATTEMPTS_PER_MAZE: u64 = 100;
 
 impl Args {
+    /// What this invocation does: re-solve a puzzle file, or generate a dataset.
+    pub fn mode(&self) -> Result<Mode, String> {
+        match self.puzzle_file.as_deref() {
+            Some(path) => Ok(Mode::Resolve(self.validate_resolve(path)?)),
+            None => Ok(Mode::Generate(Box::new(self.validate()?))),
+        }
+    }
+
+    /// Validate a `--puzzle-file` run.
+    ///
+    /// Deliberately shares nothing with `validate`: there are no partitions, no `--output`, and
+    /// no `MIN_GRID` floor (that exists because the lattice generators spin forever on a narrow
+    /// grid — a small *record* re-solves fine). Dimensions come from each record.
+    fn validate_resolve(&self, path: &str) -> Result<ResolveOpts, String> {
+        if path.trim().is_empty() {
+            return Err("--puzzle-file must be a JSONL file path".into());
+        }
+        let input = Path::new(path);
+        if input.is_dir() {
+            return Err(format!(
+                "--puzzle-file {path} is a directory; pass one JSONL file"
+            ));
+        }
+        if !input.is_file() {
+            return Err(format!("--puzzle-file {path}: no such file"));
+        }
+        Ok(ResolveOpts {
+            inputs: vec![input.to_path_buf()],
+            // Only one solver exists; the record's own `solver` field is copied, not read.
+            solver: self.solver.unwrap_or(SolverType::AStar),
+        })
+    }
+
     /// Validate inputs; resolve the requested partitions and the sampling mode.
     pub fn validate(&self) -> Result<Validated, String> {
         let generator = self.generator.ok_or("--generator is required")?;
@@ -332,6 +404,7 @@ mod tests {
             allow_underfill: false,
             exclude: None,
             legacy_query_first: false,
+            puzzle_file: None,
         }
     }
 
@@ -424,6 +497,66 @@ mod tests {
         );
         a.legacy_query_first = true;
         assert_eq!(a.validate().unwrap().query_placement, QueryPlacement::First);
+    }
+
+    #[test]
+    fn puzzle_file_needs_no_generate_arguments() {
+        // The whole point of the mode: `--puzzle-file <path>` on its own is a complete command.
+        let path = std::env::temp_dir().join(format!("maze_cli_{}.jsonl", std::process::id()));
+        std::fs::write(&path, "").unwrap();
+        let argv = ["maze_gen_fast", "--puzzle-file", path.to_str().unwrap()];
+
+        let parsed = Args::try_parse_from(argv).expect("parses without --generator/--output");
+        match parsed.mode().unwrap() {
+            Mode::Resolve(opts) => {
+                assert_eq!(opts.inputs, vec![path.clone()]);
+                assert_eq!(opts.solver, SolverType::AStar);
+            }
+            Mode::Generate(_) => panic!("--puzzle-file must select the resolve mode"),
+        }
+
+        // Arguments that still mean something alongside it.
+        for extra in [["--threads", "2"], ["--solver", "astar"]] {
+            let mut with_extra = argv.to_vec();
+            with_extra.extend(extra);
+            assert!(Args::try_parse_from(&with_extra).is_ok(), "{extra:?}");
+        }
+
+        // Generate-only arguments are rejected rather than silently ignored.
+        let rejected: [&[&str]; 12] = [
+            &["--max-attempts", "5"],
+            &["--list-params"],
+            &["--output", "d"],
+            &["--train", "5"],
+            &["--test", "5"],
+            &["--eval", "5"],
+            &["--generator", "wilson"],
+            &["--balanced"],
+            &["--exclude", "d"],
+            &["--param", "a=b"],
+            &["--legacy-query-first"],
+            &["--allow-underfill"],
+        ];
+        for extra in rejected {
+            let mut with_extra = argv.to_vec();
+            with_extra.extend_from_slice(extra);
+            assert!(
+                Args::try_parse_from(&with_extra).is_err(),
+                "{extra:?} should conflict with --puzzle-file"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn puzzle_file_must_name_an_existing_file() {
+        let mut a = args(None, None, Some(5));
+        a.puzzle_file = Some("  ".into());
+        assert!(a.mode().unwrap_err().contains("--puzzle-file"));
+        a.puzzle_file = Some("/nonexistent/nope.jsonl".into());
+        assert!(a.mode().unwrap_err().contains("no such file"));
+        a.puzzle_file = Some(std::env::temp_dir().to_string_lossy().into_owned());
+        assert!(a.mode().unwrap_err().contains("directory"));
     }
 
     #[test]
