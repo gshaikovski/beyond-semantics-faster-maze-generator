@@ -11,21 +11,11 @@
 //! trace is never touched.
 
 use crate::dedup::{key_from_parts, LayoutKey};
+use crate::jsonl::{locate_text, parse_field, COLS_KEY, READ_BUFFER, ROWS_KEY, TRACE_MARKER};
 use crate::types::Maze;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-
-/// Read buffer for the line scan.
-const READ_BUFFER: usize = 8 * 1024 * 1024;
-
-/// Keys of the emitted JSON record.
-const TEXT_KEY: &str = "\"text\":\"";
-const ROWS_KEY: &str = "\"rows\":";
-const COLS_KEY: &str = "\"cols\":";
-
-/// Separator between the prompt (walls) and the search trace.
-const TRACE_MARKER: &str = " reasoning";
 
 /// Tallies from one scan, for the stderr summary.
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -54,29 +44,12 @@ pub fn partition_files_in(dir: &str) -> Vec<String> {
 ///
 /// Cloned per line and punched with the record's walls — far cheaper than setting every cell.
 fn floor_template(rows: usize, cols: usize) -> Vec<u8> {
-    let mut maze = Maze::new(rows, cols);
-    for y in 0..rows {
-        for x in 0..cols {
-            maze.set_cell(x, y, true);
-        }
-    }
-    maze.grid
+    Maze::all_floor(rows, cols).grid
 }
 
 /// Clear one cell (mark it a wall) in a packed grid.
 fn clear_cell(grid: &mut [u8], cols_bytes: usize, x: usize, y: usize) {
     grid[y * cols_bytes + (x / 8)] &= !(1 << (x % 8));
-}
-
-/// Read the integer value of `key` from the record's tail.
-fn parse_field(tail: &str, key: &str) -> Result<usize, String> {
-    let at = tail.find(key).ok_or_else(|| format!("no {key} key"))?;
-    tail[at + key.len()..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .map_err(|_| format!("unparsable {key} value"))
 }
 
 /// Layout key of one JSONL line, or `None` when the record's grid shape differs from the run's
@@ -87,14 +60,9 @@ fn parse_line(
     cols: usize,
     template: &[u8],
 ) -> Result<Option<LayoutKey>, String> {
-    let at = line
-        .find(TEXT_KEY)
-        .ok_or_else(|| format!("no {TEXT_KEY} key"))?;
-    let rest = &line[at + TEXT_KEY.len()..];
-    let end = rest
-        .find('"')
-        .ok_or_else(|| "unterminated \"text\" value".to_string())?;
-    let (text, tail) = rest.split_at(end);
+    let span = locate_text(line)?;
+    let text = &line[span.value_start..span.close_quote];
+    let tail = &line[span.close_quote..];
 
     if parse_field(tail, ROWS_KEY)? != rows || parse_field(tail, COLS_KEY)? != cols {
         return Ok(None);

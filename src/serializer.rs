@@ -1,4 +1,4 @@
-use crate::types::{MazeResult, ReasoningEvent};
+use crate::types::{MazeResult, ReasoningEvent, Solution};
 use crate::{GeneratorType, SolverType};
 use rayon::prelude::*;
 use std::fmt::Write as FmtWrite;
@@ -67,6 +67,44 @@ fn write_walls<W: Write>(
     Ok(())
 }
 
+/// Write the trace and plan half of a `text` value: ` reasoning … solution … end`.
+///
+/// Stops short of the closing quote, so `--puzzle-file` can splice this onto a record's
+/// original prompt bytes and follow it with the rest of that record verbatim.
+pub fn write_trace_and_plan<W: Write>(
+    writer: &mut W,
+    solution: &Solution,
+    buffer: &mut String,
+) -> std::io::Result<()> {
+    writer.write_all(b" reasoning")?;
+    for event in &solution.reasoning {
+        match event {
+            ReasoningEvent::Close { x, y, g, h } => {
+                writer.write_all(b" close ")?;
+                buffer.clear();
+                write!(buffer, "{} {} c{} c{}", x, y, g, h).unwrap();
+                writer.write_all(buffer.as_bytes())?;
+            }
+            ReasoningEvent::Create { x, y, g, h } => {
+                writer.write_all(b" create ")?;
+                buffer.clear();
+                write!(buffer, "{} {} c{} c{}", x, y, g, h).unwrap();
+                writer.write_all(buffer.as_bytes())?;
+            }
+        }
+    }
+
+    writer.write_all(b" solution")?;
+    for &(x, y) in &solution.path {
+        writer.write_all(b" plan ")?;
+        buffer.clear();
+        write!(buffer, "{} {}", x, y).unwrap();
+        writer.write_all(buffer.as_bytes())?;
+    }
+
+    writer.write_all(b" end")
+}
+
 /// Write a maze result directly to a writer as JSON
 pub fn write_maze_json<W: Write>(
     writer: &mut W,
@@ -99,35 +137,11 @@ pub fn write_maze_json<W: Write>(
         }
     }
 
-    // Write reasoning trace
-    writer.write_all(b" reasoning")?;
-    for event in &result.solution.reasoning {
-        match event {
-            ReasoningEvent::Close { x, y, g, h } => {
-                writer.write_all(b" close ")?;
-                buffer.clear();
-                write!(buffer, "{} {} c{} c{}", x, y, g, h).unwrap();
-                writer.write_all(buffer.as_bytes())?;
-            }
-            ReasoningEvent::Create { x, y, g, h } => {
-                writer.write_all(b" create ")?;
-                buffer.clear();
-                write!(buffer, "{} {} c{} c{}", x, y, g, h).unwrap();
-                writer.write_all(buffer.as_bytes())?;
-            }
-        }
-    }
+    // Write the reasoning trace and the solution path
+    write_trace_and_plan(writer, &result.solution, buffer)?;
 
-    // Write solution path
-    writer.write_all(b" solution")?;
-    for &(x, y) in &result.solution.path {
-        writer.write_all(b" plan ")?;
-        buffer.clear();
-        write!(buffer, "{} {}", x, y).unwrap();
-        writer.write_all(buffer.as_bytes())?;
-    }
-
-    writer.write_all(b" end\"")?;
+    // Close the text value
+    writer.write_all(b"\"")?;
 
     // Write remaining fields
     writer.write_all(b",\"generator\":\"")?;
@@ -206,7 +220,7 @@ pub fn process_batch(results: &[MazeResult], placement: QueryPlacement) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Maze, Solution};
+    use crate::types::Maze;
 
     /// A 3x3 maze with walls at (1,0) and (0,2), solved by a two-step trace.
     fn result_3x3(walls: &[(usize, usize)]) -> MazeResult {
@@ -299,6 +313,20 @@ mod tests {
             );
             assert!(!text.contains("  "), "{text}");
         }
+    }
+
+    #[test]
+    fn the_shared_helper_writes_the_records_own_trace_and_plan() {
+        // `--puzzle-file` splices this fragment onto a record's original prompt, so it has to
+        // be exactly what the record writer would have emitted there.
+        let result = result_3x3(&[(1, 0)]);
+        let text = text_of(&result, QueryPlacement::AfterWalls);
+        let mut fragment = Vec::new();
+        let mut buffer = String::new();
+        write_trace_and_plan(&mut fragment, &result.solution, &mut buffer).unwrap();
+        let fragment = String::from_utf8(fragment).unwrap();
+        assert!(fragment.starts_with(" reasoning") && fragment.ends_with(" end"));
+        assert_eq!(&text[text.find(" reasoning").unwrap()..], fragment);
     }
 
     #[test]
