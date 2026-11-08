@@ -24,11 +24,11 @@ use std::thread;
 use std::time::Instant;
 
 use crate::cli::{Args, BalancedOpts, Mode, Partition, PartitionKind, Validated};
-use crate::dedup::{layout_key, LayoutKey, SeenSet};
+use crate::dedup::{layout_key, query_key, SeenSet};
 use crate::parameters::{print_all_params_help, print_param_help, GeneratorParams};
 use crate::prng::create_instance_prng;
 use crate::serializer::{process_batch, QueryPlacement};
-use crate::types::MazeResult;
+use crate::types::{Maze, MazeResult};
 
 #[derive(Clone, Copy, Debug, ValueEnum, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -55,6 +55,10 @@ const BATCH_SIZE: usize = 1000;
 /// except at the end of the run.
 const CHUNK: u64 = 8 * BATCH_SIZE as u64;
 
+/// Instance id whose PRNG draws the `--fixed-maze` layout; the candidate stream counts up from 0
+/// and never reaches it.
+const FIXED_LAYOUT_ID: u64 = u64::MAX;
+
 /// Shared maze-generation parameters; threaded through the candidate stream.
 #[derive(Clone, Copy)]
 struct GenSpec<'a> {
@@ -64,6 +68,8 @@ struct GenSpec<'a> {
     rows: usize,
     cols: usize,
     params: &'a GeneratorParams,
+    /// `--fixed-maze` layout shared by every instance; `None` = a fresh layout per instance.
+    fixed: Option<&'a Maze>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -98,14 +104,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         validated.output_dir
     );
 
-    let spec = GenSpec {
+    let mut spec = GenSpec {
         seed: args.seed,
         generator: validated.generator,
         solver: validated.solver,
         rows: validated.rows,
         cols: validated.cols,
         params: &generator_params,
+        fixed: None,
     };
+    let fixed_layout = validated.fixed_maze.then(|| fixed_layout(spec));
+    if let Some(layout) = &fixed_layout {
+        let floors = generators::floors(layout).len() as u64;
+        let queries = floors * (floors - 1);
+        println!("Fixed maze: {floors} floor cells, {queries} distinct queries");
+        if validated.total_count() > queries {
+            return Err(format!(
+                "--fixed-maze: requested {} mazes but the layout admits only {queries} \
+                 distinct (start, goal) pairs; enlarge --rows/--cols or lower the counts",
+                validated.total_count()
+            )
+            .into());
+        }
+    }
+    spec.fixed = fixed_layout.as_ref();
 
     let (emitted, attempts, duplicates) = run(spec, &args, &validated)?;
 
@@ -113,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rate = emitted as f64 / elapsed.as_secs_f64();
     println!("\nCompleted in {:.2}s", elapsed.as_secs_f64());
     println!(
-        "Generated {} mazes at {:.2} mazes/second ({} candidates, {} duplicate layouts skipped)",
+        "Generated {} mazes at {:.2} mazes/second ({} candidates, {} duplicates skipped)",
         emitted, rate, attempts, duplicates
     );
 
@@ -126,11 +148,21 @@ struct Batch {
     n: u64,
 }
 
+/// The `--fixed-maze` layout: drawn once, from its own reserved PRNG stream.
+fn fixed_layout(spec: GenSpec) -> Maze {
+    let mut rng = create_instance_prng(spec.seed, spec.generator, spec.solver, FIXED_LAYOUT_ID);
+    generators::generate_maze(spec.generator, &mut rng, spec.rows, spec.cols, spec.params)
+}
+
 /// Generate and solve a single maze deterministically from its instance id.
 fn generate_one(spec: GenSpec, instance_id: u64) -> MazeResult {
     let mut rng = create_instance_prng(spec.seed, spec.generator, spec.solver, instance_id);
-    let maze =
-        generators::generate_maze(spec.generator, &mut rng, spec.rows, spec.cols, spec.params);
+    let maze = match spec.fixed {
+        Some(layout) => generators::with_random_query(layout, &mut rng),
+        None => {
+            generators::generate_maze(spec.generator, &mut rng, spec.rows, spec.cols, spec.params)
+        }
+    };
     let solution = solvers::solve_maze(spec.solver, &maze);
     MazeResult {
         instance_id,
@@ -211,8 +243,13 @@ impl<'a> CandidateStream<'a> {
         }
     }
 
-    /// Claim a layout for emission; `false` when it was already emitted or excluded.
-    fn claim(&mut self, key: LayoutKey) -> bool {
+    /// Claim an instance for emission; `false` when it was already emitted or excluded.
+    /// - Identity is the layout, or under `--fixed-maze` (one shared layout) the query.
+    fn claim(&mut self, maze: &Maze) -> bool {
+        let key = match self.spec.fixed {
+            Some(_) => query_key(maze),
+            None => layout_key(maze),
+        };
         if self.seen.claim(key) {
             return true;
         }
@@ -448,6 +485,10 @@ fn generate_partition(
         let Some(result) = stream.next_candidate() else {
             break;
         };
+        // Only a `--fixed-maze` searchformer layout (not validated per query) can be unsolvable.
+        if result.solution.path.is_empty() {
+            continue;
+        }
         let bin = match bins {
             Some(b) => {
                 match balanced::bin_index(
@@ -465,7 +506,7 @@ fn generate_partition(
         if filled[bin] >= caps[bin] {
             continue;
         }
-        if !stream.claim(layout_key(&result.maze)) {
+        if !stream.claim(&result.maze) {
             continue;
         }
         filled[bin] += 1;
@@ -496,7 +537,7 @@ fn report_underfill(
     duplicates: u64,
 ) {
     eprintln!(
-        "\nUnder-filled {} after {} candidates (emitted {}/{}, {} duplicate layouts skipped):",
+        "\nUnder-filled {} after {} candidates (emitted {}/{}, {} duplicates skipped):",
         part.kind.stem(),
         attempts,
         outcome.emitted,
@@ -591,4 +632,38 @@ fn run(
     }
 
     Ok((total, stream.attempts(), stream.duplicates))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_maze_shares_the_layout_and_never_repeats_a_query() {
+        let params = GeneratorParams::from_vec(Vec::new()).unwrap();
+        let mut spec = GenSpec {
+            seed: 0,
+            generator: GeneratorType::Wilson,
+            solver: SolverType::AStar,
+            rows: 5,
+            cols: 5,
+            params: &params,
+            fixed: None,
+        };
+        let layout = fixed_layout(spec);
+        spec.fixed = Some(&layout);
+        let n = generators::floors(&layout).len();
+
+        // One stream spans every split, so "no repeat in the stream" = none across splits.
+        let mut stream = CandidateStream::new(spec, 20_000, 0);
+        let mut emitted = 0;
+        while let Some(r) = stream.next_candidate() {
+            assert_eq!(layout_key(&r.maze), layout_key(&layout));
+            assert_ne!(r.maze.start, r.maze.goal);
+            assert!(!r.solution.path.is_empty());
+            emitted += stream.claim(&r.maze) as usize;
+        }
+        // Every ordered pair of distinct floor cells is drawn, and claimed exactly once.
+        assert_eq!(emitted, n * (n - 1));
+    }
 }

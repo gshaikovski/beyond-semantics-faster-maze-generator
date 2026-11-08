@@ -6,6 +6,9 @@
 //! split leaks a solved layout into eval. (This mirrors the countdown generator, which
 //! excludes by number multiset whatever the target.)
 //!
+//! Under `--fixed-maze` every instance shares one layout by design, so identity is the QUERY
+//! instead: the ordered (start, goal) pair.
+//!
 //! Stored keys are 128-bit FNV-1a digests, not the layouts themselves: 5M keys cost ~100MB
 //! against ~400MB for verbatim 20x20 grids, and the birthday collision probability over 5M
 //! keys is ~1e-25 — far below the chance of a disk error silently corrupting the dataset.
@@ -44,6 +47,15 @@ pub fn key_from_parts(rows: usize, cols: usize, grid: &[u8]) -> LayoutKey {
 /// Layout key of a generated maze (start and goal deliberately excluded).
 pub fn layout_key(maze: &Maze) -> LayoutKey {
     key_from_parts(maze.rows, maze.cols, &maze.grid)
+}
+
+/// Query key of an instance on a fixed layout: its ordered (start, goal) pair.
+/// - Packed losslessly (each coordinate < 2^32), so it cannot collide.
+pub fn query_key(maze: &Maze) -> LayoutKey {
+    let ((sx, sy), (gx, gy)) = (maze.start, maze.goal);
+    [sx, sy, gx, gy]
+        .iter()
+        .fold(0, |key, &v| (key << 32) | v as LayoutKey)
 }
 
 /// The layouts already emitted (or excluded), shared across every partition of a run.
@@ -107,6 +119,19 @@ mod tests {
         let grid = vec![0u8; 4];
         assert_ne!(key_from_parts(2, 8, &grid), key_from_parts(4, 8, &grid));
         assert_ne!(key_from_parts(4, 8, &grid), key_from_parts(4, 5, &grid));
+    }
+
+    #[test]
+    fn query_key_is_the_ordered_start_goal_pair() {
+        let mut a = maze_with(5, 5, &[(1, 1)]);
+        let mut b = maze_with(5, 5, &[(2, 2)]);
+        (a.start, a.goal) = ((0, 1), (2, 3));
+        (b.start, b.goal) = ((0, 1), (2, 3));
+        assert_eq!(query_key(&a), query_key(&b));
+        // Reversed query is a different instance (different trace and plan).
+        b.start = (2, 3);
+        b.goal = (0, 1);
+        assert_ne!(query_key(&a), query_key(&b));
     }
 
     #[test]

@@ -71,6 +71,8 @@ pub struct Validated {
     pub exclude_dir: Option<String>,
     /// Where the `query start ... goal ...` block sits in the emitted `text`.
     pub query_placement: QueryPlacement,
+    /// One wall layout for every instance of every split; only the query varies.
+    pub fixed_maze: bool,
 }
 
 impl Validated {
@@ -203,13 +205,18 @@ pub struct Args {
     #[arg(long)]
     pub legacy_query_first: bool,
 
+    /// Use one wall layout for every instance in every split; each instance draws its own
+    /// start/goal, and no (start, goal) pair repeats within or across splits
+    #[arg(long, conflicts_with = "exclude")]
+    pub fixed_maze: bool,
+
     /// Re-solve an existing maze JSONL instead of generating one: writes
     /// <dir>/<stem>_resolved.jsonl with a fresh A* trace and optimal plan per record, every
     /// other JSON key copied verbatim
     #[arg(long, conflicts_with_all = [
         "list_params", "generator", "output", "eval", "test", "train",
         "balanced", "exclude", "params", "legacy_query_first",
-        "max_attempts", "allow_underfill",
+        "max_attempts", "allow_underfill", "fixed_maze",
     ])]
     pub puzzle_file: Option<String>,
 }
@@ -325,6 +332,7 @@ impl Args {
                 true => QueryPlacement::First,
                 false => QueryPlacement::AfterWalls,
             },
+            fixed_maze: self.fixed_maze,
         })
     }
 
@@ -404,6 +412,7 @@ mod tests {
             allow_underfill: false,
             exclude: None,
             legacy_query_first: false,
+            fixed_maze: false,
             puzzle_file: None,
         }
     }
@@ -523,7 +532,7 @@ mod tests {
         }
 
         // Generate-only arguments are rejected rather than silently ignored.
-        let rejected: [&[&str]; 12] = [
+        let rejected: [&[&str]; 13] = [
             &["--max-attempts", "5"],
             &["--list-params"],
             &["--output", "d"],
@@ -536,6 +545,7 @@ mod tests {
             &["--param", "a=b"],
             &["--legacy-query-first"],
             &["--allow-underfill"],
+            &["--fixed-maze"],
         ];
         for extra in rejected {
             let mut with_extra = argv.to_vec();

@@ -72,6 +72,22 @@ Consequences worth knowing:
 
 Records whose grid shape differs from the current `--rows`/`--cols` are skipped (they cannot collide); an unparsable line is a hard error, since silently ignoring one would leave the datasets overlapping.
 
+## One maze for every instance (`--fixed-maze`)
+
+`--fixed-maze` draws a single wall layout and uses it for every instance in every split; each instance draws its own start and goal, so only the query, the trace and the plan vary.
+
+```bash
+./target/release/maze_gen_fast -g wilson -s astar --rows 20 --cols 20 --seed 0 \
+    --train 30000 --test 1000 --fixed-maze -o maze_wilson_20_fixed_seed_0
+# Fixed maze: 199 floor cells, 39402 distinct queries
+```
+
+- The layout is a function of `--seed`/`--generator`/`--rows`/`--cols` alone (its own reserved PRNG stream), so two runs with the same arguments share it.
+- Start/goal are uniform over **ordered** pairs of distinct floor cells. Identity becomes the query instead of the layout: no `(start, goal)` pair repeats within or across splits. `(s, g)` and `(g, s)` are different instances; their plans are reverses of each other.
+- Capacity is `n(n-1)` for `n` floor cells, printed at start; a larger request fails before anything is written. `--balanced` is further limited by how few pairs have long paths on the one layout.
+- Conflicts with `--exclude` (layout exclusion is meaningless when every instance shares the layout).
+- `searchformer` layouts are not connected: unreachable pairs are skipped, and its usual minimum path length (`>= max(rows, cols)`) is not enforced per query.
+
 ## Re-solving an existing file (`--puzzle-file`)
 
 `--puzzle-file <path.jsonl>` reads mazes instead of generating them: each record is re-solved
