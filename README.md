@@ -166,3 +166,11 @@ query start 0 0 goal 2 2 wall 1 0 wall 0 2 reasoning close ... solution plan ...
 ```
 
 Only the order changes — same tokens, same wall order, same trace. `--exclude` reads either layout, and the flag is recorded in `args.json`.
+
+`--hide-walls` drops the wall list entirely, so the prompt is the query alone (meant for `--fixed-maze`, where the layout is the same in every record):
+
+```
+query start 0 0 goal 2 2 reasoning close ... solution plan ... end
+```
+
+The layout is then not recoverable from the record: anything that reads walls back out of `text` (`--exclude`, `--puzzle-file`, a plan verifier) sees an open grid. Conflicts with `--legacy-query-first`.

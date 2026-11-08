@@ -4,9 +4,10 @@ use rayon::prelude::*;
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
 
-/// Where the `query start ... goal ...` block sits inside `text`.
+/// The prompt layout: where the `query start ... goal ...` block sits inside `text`, and
+/// whether the wall list is written at all.
 ///
-/// The token multiset is identical either way; only the order changes.
+/// The token multiset is identical between `AfterWalls` and `First`; only the order changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum QueryPlacement {
     /// Default: `wall ... query start sx sy goal gx gy reasoning ...`.
@@ -17,6 +18,8 @@ pub enum QueryPlacement {
     /// `--legacy-query-first`: the original layout,
     /// `query start sx sy goal gx gy wall ... reasoning ...`.
     First,
+    /// `--hide-walls`: no wall list, `query start sx sy goal gx gy reasoning ...`.
+    QueryOnly,
 }
 
 /// Write the `query start sx sy goal gx gy` block.
@@ -135,6 +138,7 @@ pub fn write_maze_json<W: Write>(
             write_query_block(writer, result, buffer)?;
             write_walls(writer, result, buffer, false)?;
         }
+        QueryPlacement::QueryOnly => write_query_block(writer, result, buffer)?,
     }
 
     // Write the reasoning trace and the solution path
@@ -283,6 +287,15 @@ mod tests {
         assert_eq!(
             text_of(&result_3x3(&[(1, 0), (0, 2)]), QueryPlacement::First),
             "query start 0 0 goal 2 2 wall 1 0 wall 0 2 \
+             reasoning create 0 0 c0 c4 close 0 0 c0 c4 solution plan 0 0 plan 2 2 end"
+        );
+    }
+
+    #[test]
+    fn hidden_walls_leave_only_the_query_in_the_prompt() {
+        assert_eq!(
+            text_of(&result_3x3(&[(1, 0), (0, 2)]), QueryPlacement::QueryOnly),
+            "query start 0 0 goal 2 2 \
              reasoning create 0 0 c0 c4 close 0 0 c0 c4 solution plan 0 0 plan 2 2 end"
         );
     }
