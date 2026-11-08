@@ -167,10 +167,14 @@ query start 0 0 goal 2 2 wall 1 0 wall 0 2 reasoning close ... solution plan ...
 
 Only the order changes — same tokens, same wall order, same trace. `--exclude` reads either layout, and the flag is recorded in `args.json`.
 
-`--hide-walls` drops the wall list entirely, so the prompt is the query alone (meant for `--fixed-maze`, where the layout is the same in every record):
+`--hide-walls` (requires `--fixed-maze`) drops the wall list from every record, so the prompt is the query alone, and writes the shared layout's walls once to `walls.txt` beside `args.json`:
 
 ```
-query start 0 0 goal 2 2 reasoning close ... solution plan ... end
+walls.txt:   wall 1 0 wall 0 2
+train.jsonl: query start 0 0 goal 2 2 reasoning close ... solution plan ... end
 ```
 
-The layout is then not recoverable from the record: anything that reads walls back out of `text` (`--exclude`, `--puzzle-file`, a plan verifier) sees an open grid. Conflicts with `--legacy-query-first`.
+- `walls.txt` is one line: the wall list exactly as it would open a default-placement `text`. `<walls.txt line> + " " + text` rebuilds the walls-visible record byte-for-byte.
+- It is never silently replaced: a later run adding another split to the directory may rewrite the same layout, and a different layout is an error.
+- The records alone no longer describe the maze. Anything that reads walls back out of `text` (`--exclude`, `--puzzle-file`, a plan verifier) sees an open grid unless it reads `walls.txt`.
+- Conflicts with `--legacy-query-first`.

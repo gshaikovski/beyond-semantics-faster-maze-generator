@@ -1,4 +1,4 @@
-use crate::types::{MazeResult, ReasoningEvent, Solution};
+use crate::types::{Maze, MazeResult, ReasoningEvent, Solution};
 use crate::{GeneratorType, SolverType};
 use rayon::prelude::*;
 use std::fmt::Write as FmtWrite;
@@ -46,13 +46,13 @@ fn write_query_block<W: Write>(
 ///   space has to sit on the side that faces the query block either way.
 fn write_walls<W: Write>(
     writer: &mut W,
-    result: &MazeResult,
+    maze: &Maze,
     buffer: &mut String,
     trailing: bool,
 ) -> std::io::Result<()> {
-    for y in 0..result.maze.rows {
-        for x in 0..result.maze.cols {
-            if result.maze.get_cell(x, y) {
+    for y in 0..maze.rows {
+        for x in 0..maze.cols {
+            if maze.get_cell(x, y) {
                 continue;
             }
             if !trailing {
@@ -68,6 +68,16 @@ fn write_walls<W: Write>(
         }
     }
     Ok(())
+}
+
+/// The wall list alone, `wall x y wall x y ...`, exactly as it opens a default-placement `text`
+/// (minus the space before `query`): the `walls.txt` that `--hide-walls` writes.
+pub fn walls_line(maze: &Maze) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_walls(&mut out, maze, &mut String::new(), true).expect("writing to a Vec");
+    // Drop the separator that would face the query block.
+    out.pop();
+    out
 }
 
 /// Write the trace and plan half of a `text` value: ` reasoning … solution … end`.
@@ -131,12 +141,12 @@ pub fn write_maze_json<W: Write>(
     // Prompt: the query block and the wall list, in the requested order.
     match placement {
         QueryPlacement::AfterWalls => {
-            write_walls(writer, result, buffer, true)?;
+            write_walls(writer, &result.maze, buffer, true)?;
             write_query_block(writer, result, buffer)?;
         }
         QueryPlacement::First => {
             write_query_block(writer, result, buffer)?;
-            write_walls(writer, result, buffer, false)?;
+            write_walls(writer, &result.maze, buffer, false)?;
         }
         QueryPlacement::QueryOnly => write_query_block(writer, result, buffer)?,
     }
@@ -298,6 +308,19 @@ mod tests {
             "query start 0 0 goal 2 2 \
              reasoning create 0 0 c0 c4 close 0 0 c0 c4 solution plan 0 0 plan 2 2 end"
         );
+    }
+
+    #[test]
+    fn walls_line_plus_hidden_prompt_rebuilds_the_default_text() {
+        let result = result_3x3(&[(1, 0), (0, 2)]);
+        let walls = String::from_utf8(walls_line(&result.maze)).unwrap();
+        assert_eq!(walls, "wall 1 0 wall 0 2");
+        let hidden = text_of(&result, QueryPlacement::QueryOnly);
+        assert_eq!(
+            format!("{walls} {hidden}"),
+            text_of(&result, QueryPlacement::AfterWalls)
+        );
+        assert!(walls_line(&result_3x3(&[]).maze).is_empty());
     }
 
     #[test]

@@ -205,8 +205,9 @@ pub struct Args {
     #[arg(long)]
     pub legacy_query_first: bool,
 
-    /// Omit the wall list from `text`: the prompt is just `query start ... goal ...`
-    #[arg(long, conflicts_with = "legacy_query_first")]
+    /// Omit the wall list from `text`: the prompt is just `query start ... goal ...`; the
+    /// shared layout's walls go to walls.txt in the dataset directory instead
+    #[arg(long, requires = "fixed_maze", conflicts_with = "legacy_query_first")]
     pub hide_walls: bool,
 
     /// Use one wall layout for every instance in every split; each instance draws its own
@@ -518,6 +519,27 @@ mod tests {
             a.validate().unwrap().query_placement,
             QueryPlacement::QueryOnly
         );
+    }
+
+    #[test]
+    fn hide_walls_requires_a_fixed_maze() {
+        // One walls.txt can only describe the records when they share one layout.
+        let argv = [
+            "maze_gen_fast",
+            "-g",
+            "wilson",
+            "-s",
+            "astar",
+            "--train",
+            "5",
+            "-o",
+            "d",
+            "--hide-walls",
+        ];
+        assert!(Args::try_parse_from(argv).is_err());
+        let mut with_fixed = argv.to_vec();
+        with_fixed.push("--fixed-maze");
+        assert!(Args::try_parse_from(with_fixed).is_ok());
     }
 
     #[test]
