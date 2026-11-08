@@ -205,6 +205,10 @@ pub struct Args {
     #[arg(long)]
     pub legacy_query_first: bool,
 
+    /// Omit the wall list from `text`: the prompt is just `query start ... goal ...`
+    #[arg(long, conflicts_with = "legacy_query_first")]
+    pub hide_walls: bool,
+
     /// Use one wall layout for every instance in every split; each instance draws its own
     /// start/goal, and no (start, goal) pair repeats within or across splits
     #[arg(long, conflicts_with = "exclude")]
@@ -216,7 +220,7 @@ pub struct Args {
     #[arg(long, conflicts_with_all = [
         "list_params", "generator", "output", "eval", "test", "train",
         "balanced", "exclude", "params", "legacy_query_first",
-        "max_attempts", "allow_underfill", "fixed_maze",
+        "max_attempts", "allow_underfill", "fixed_maze", "hide_walls",
     ])]
     pub puzzle_file: Option<String>,
 }
@@ -328,9 +332,10 @@ impl Args {
             max_attempts,
             allow_underfill: self.allow_underfill,
             exclude_dir,
-            query_placement: match self.legacy_query_first {
-                true => QueryPlacement::First,
-                false => QueryPlacement::AfterWalls,
+            query_placement: match (self.hide_walls, self.legacy_query_first) {
+                (true, _) => QueryPlacement::QueryOnly,
+                (false, true) => QueryPlacement::First,
+                (false, false) => QueryPlacement::AfterWalls,
             },
             fixed_maze: self.fixed_maze,
         })
@@ -412,6 +417,7 @@ mod tests {
             allow_underfill: false,
             exclude: None,
             legacy_query_first: false,
+            hide_walls: false,
             fixed_maze: false,
             puzzle_file: None,
         }
@@ -506,6 +512,12 @@ mod tests {
         );
         a.legacy_query_first = true;
         assert_eq!(a.validate().unwrap().query_placement, QueryPlacement::First);
+        a.legacy_query_first = false;
+        a.hide_walls = true;
+        assert_eq!(
+            a.validate().unwrap().query_placement,
+            QueryPlacement::QueryOnly
+        );
     }
 
     #[test]
@@ -532,7 +544,7 @@ mod tests {
         }
 
         // Generate-only arguments are rejected rather than silently ignored.
-        let rejected: [&[&str]; 13] = [
+        let rejected: [&[&str]; 14] = [
             &["--max-attempts", "5"],
             &["--list-params"],
             &["--output", "d"],
@@ -546,6 +558,7 @@ mod tests {
             &["--legacy-query-first"],
             &["--allow-underfill"],
             &["--fixed-maze"],
+            &["--hide-walls"],
         ];
         for extra in rejected {
             let mut with_extra = argv.to_vec();
