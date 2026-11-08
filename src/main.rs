@@ -370,6 +370,30 @@ fn write_args_json(dir: &str, args: &Args) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Write the shared layout's wall list as `walls.txt` (`--hide-walls`).
+///
+/// - Prepending it plus a space to a record's `text` rebuilds the default-placement record.
+/// - Never silently replaced: rewriting the same layout is a no-op, a different one is an error
+///   (it would no longer describe the partitions already in the directory).
+fn write_walls_txt(dir: &str, layout: &Maze) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(dir).join("walls.txt");
+    let mut text = serializer::walls_line(layout);
+    text.push(b'\n');
+    if let Ok(existing) = std::fs::read(&path) {
+        if existing == text {
+            return Ok(());
+        }
+        return Err(format!(
+            "{} holds a different layout (another --seed/--generator/--rows/--cols?); \
+             refusing to overwrite it",
+            path.display()
+        )
+        .into());
+    }
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// Pre-seed the seen-set from an existing dataset directory (`--exclude`).
 fn load_exclusions(
     stream: &mut CandidateStream,
@@ -572,6 +596,10 @@ fn run(
     validated: &Validated,
 ) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
     prepare_output_dir(&validated.output_dir, &validated.partitions)?;
+    // `--hide-walls` requires `--fixed-maze`, so the layout is always there.
+    if let (QueryPlacement::QueryOnly, Some(layout)) = (validated.query_placement, spec.fixed) {
+        write_walls_txt(&validated.output_dir, layout)?;
+    }
     write_args_json(&validated.output_dir, args)?;
 
     let mut stream = CandidateStream::new(spec, validated.max_attempts, validated.total_count());
@@ -637,6 +665,32 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walls_txt_is_written_once_and_never_replaced_by_another_layout() {
+        let dir = std::env::temp_dir().join(format!("maze_walls_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap();
+        let mut a = Maze::all_floor(4, 4);
+        a.set_cell(1, 0, false);
+        let mut b = a.clone();
+        b.set_cell(2, 3, false);
+
+        write_walls_txt(dir_str, &a).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("walls.txt")).unwrap(),
+            "wall 1 0\n"
+        );
+        // Same layout again (e.g. a later run adding another split): fine.
+        write_walls_txt(dir_str, &a).unwrap();
+        // A different layout would orphan the records already written.
+        assert!(write_walls_txt(dir_str, &b).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("walls.txt")).unwrap(),
+            "wall 1 0\n"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn fixed_maze_shares_the_layout_and_never_repeats_a_query() {
